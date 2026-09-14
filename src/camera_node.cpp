@@ -38,9 +38,11 @@ public:
   : rclcpp_lifecycle::LifecycleNode("camera_node", options)
   {
     declare_parameter("port", 5000);
+    declare_parameter("meta_port", -1);  // -1 → port+1; 0 disables
     declare_parameter("image_topic", "/camera/image_raw");
     declare_parameter("frame_id", "camera_optical_frame");
-    declare_parameter("calib_file", "example_calib.yaml");
+    declare_parameter("calib_source", "auto");  // auto | stream | file
+    declare_parameter("calib_file", "");  // optional fallback / file mode
     declare_parameter("stream_undistorted", false);
     declare_parameter("udp_buffer_size", 212992);
     declare_parameter("queue_size", 1);

@@ -89,6 +89,79 @@ CalibData load_calib(const std::string & path)
   return calib;
 }
 
+namespace
+{
+
+std::vector<double> json_array(const YAML::Node & node, const char * key, size_t expect)
+{
+  const auto arr = node[key];
+  if (!arr || !arr.IsSequence()) {
+    throw std::runtime_error(std::string("meta missing array '") + key + "'");
+  }
+  std::vector<double> out;
+  out.reserve(arr.size());
+  for (const auto & v : arr) {
+    out.push_back(v.as<double>());
+  }
+  if (expect != 0 && out.size() != expect) {
+    throw std::runtime_error(
+            std::string("meta '") + key + "' size " + std::to_string(out.size()) +
+            " (expected " + std::to_string(expect) + ")");
+  }
+  return out;
+}
+
+}  // namespace
+
+CalibData parse_meta_payload(
+  const std::string & payload,
+  bool * stream_undistorted_out)
+{
+  constexpr std::string_view kMagic = "UCAL1\n";
+  if (payload.size() < kMagic.size() ||
+    payload.compare(0, kMagic.size(), kMagic) != 0)
+  {
+    throw std::runtime_error("meta packet missing UCAL1 magic");
+  }
+
+  const YAML::Node doc = YAML::Load(payload.substr(kMagic.size()));
+  CalibData calib;
+  calib.width = doc["width"].as<int>(0);
+  calib.height = doc["height"].as<int>(0);
+  if (calib.width <= 0 || calib.height <= 0) {
+    throw std::runtime_error("meta width/height missing or invalid");
+  }
+  calib.camera_name = doc["camera_name"].as<std::string>("");
+  calib.distortion_model = doc["distortion_model"].as<std::string>("plumb_bob");
+  calib.K = json_array(doc, "K", 9);
+  calib.D = json_array(doc, "D", 0);
+  calib.R = json_array(doc, "R", 9);
+  calib.P = json_array(doc, "P", 12);
+  if (calib.D.size() < 4) {
+    throw std::runtime_error("meta D too short");
+  }
+  if (stream_undistorted_out && doc["stream_undistorted"]) {
+    *stream_undistorted_out = doc["stream_undistorted"].as<bool>();
+  }
+  return calib;
+}
+
+sensor_msgs::msg::CameraInfo camera_info_from_calib(
+  const CalibData & calib,
+  const std::string & frame_id)
+{
+  sensor_msgs::msg::CameraInfo msg;
+  msg.header.frame_id = frame_id;
+  msg.width = static_cast<uint32_t>(calib.width);
+  msg.height = static_cast<uint32_t>(calib.height);
+  msg.distortion_model = calib.distortion_model;
+  std::copy_n(calib.K.begin(), 9, msg.k.begin());
+  msg.d = calib.D;
+  std::copy_n(calib.R.begin(), 9, msg.r.begin());
+  std::copy_n(calib.P.begin(), 12, msg.p.begin());
+  return msg;
+}
+
 sensor_msgs::msg::CameraInfo build_camera_info(
   const CalibData & calib,
   const std::string & frame_id,

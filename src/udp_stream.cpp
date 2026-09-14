@@ -14,6 +14,12 @@
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 
@@ -105,6 +111,23 @@ void UdpStreamConfig::validate() const
     throw std::runtime_error(
             "h264_decoder must be auto|avdec_h264|vah264dec|nvh264dec (got '" +
             h264_decoder + "')");
+  }
+  if (calib_source != "auto" && calib_source != "stream" && calib_source != "file") {
+    throw std::runtime_error(
+            "calib_source must be auto|stream|file (got '" + calib_source + "')");
+  }
+  if (meta_port < 0 || meta_port > 65535) {
+    throw std::runtime_error("invalid meta_port: " + std::to_string(meta_port));
+  }
+  if (calib_source == "file" && !have_camera_info) {
+    throw std::runtime_error("calib_source=file requires a loaded calib_file");
+  }
+  if (calib_source == "stream" && meta_port == 0) {
+    throw std::runtime_error("calib_source=stream requires meta_port > 0");
+  }
+  if (!have_camera_info && meta_port == 0) {
+    throw std::runtime_error(
+            "no CameraInfo source: set calib_file and/or meta_port > 0");
   }
 }
 
@@ -228,7 +251,16 @@ void UdpStream::configure(const UdpStreamConfig & cfg)
   cfg_ = cfg;
   size_logged_ = false;
   first_frame_logged_ = false;
+  meta_logged_ = false;
   active_decoder_.clear();
+  {
+    std::lock_guard<std::mutex> lock(camera_info_mutex_);
+    live_camera_info_ = cfg_.camera_info;
+    have_camera_info_ = cfg_.have_camera_info;
+    if (have_camera_info_) {
+      live_camera_info_.header.frame_id = cfg_.frame_id;
+    }
+  }
 
   transport_node_ = std::make_shared<rclcpp::Node>(
     "camera_transport",
@@ -263,6 +295,11 @@ void UdpStream::configure(const UdpStreamConfig & cfg)
     cfg_.port, cfg_.image_topic.c_str(), cam_pub_.getInfoTopic().c_str());
   RCLCPP_INFO(
     logger_,
+    "Calib source=%s meta_port=%d have_file_info=%s",
+    cfg_.calib_source.c_str(), cfg_.meta_port,
+    cfg_.have_camera_info ? "true" : "false");
+  RCLCPP_INFO(
+    logger_,
     "Start sender AFTER activate. Example: udpsink host=<this-host-ip> port=%d sync=false",
     cfg_.port);
   RCLCPP_INFO(
@@ -277,11 +314,17 @@ void UdpStream::start()
   if (!configured_) {
     throw std::runtime_error("start() called before configure()");
   }
-  if (grab_thread_.joinable()) {
+  if (grab_thread_.joinable() || meta_thread_.joinable()) {
     throw std::runtime_error("start() called while already running");
   }
 
   stop_ = false;
+  const bool want_meta =
+    cfg_.meta_port > 0 &&
+    (cfg_.calib_source == "stream" || cfg_.calib_source == "auto");
+  if (want_meta) {
+    meta_thread_ = std::thread([this]() {meta_loop();});
+  }
   grab_thread_ = std::thread([this]() {grab_loop();});
   RCLCPP_INFO(
     logger_,
@@ -294,12 +337,22 @@ void UdpStream::stop()
   stop_ = true;
   // Unblock try_pull_sample without destroying elements the worker still holds.
   flush_pipeline();
+  if (meta_fd_ >= 0) {
+    ::shutdown(meta_fd_, SHUT_RDWR);
+  }
 
   if (grab_thread_.joinable()) {
     if (grab_thread_.get_id() != std::this_thread::get_id()) {
       grab_thread_.join();
     } else {
       grab_thread_.detach();
+    }
+  }
+  if (meta_thread_.joinable()) {
+    if (meta_thread_.get_id() != std::this_thread::get_id()) {
+      meta_thread_.join();
+    } else {
+      meta_thread_.detach();
     }
   }
 
@@ -519,8 +572,25 @@ bool UdpStream::publish_sample(void * sample_ptr)
   std::memcpy(image_msg.data.data(), map.data, expected);
   gst_buffer_unmap(buffer, &map);
 
+  sensor_msgs::msg::CameraInfo template_info;
+  bool have_info = false;
+  {
+    std::lock_guard<std::mutex> lock(camera_info_mutex_);
+    have_info = have_camera_info_;
+    if (have_info) {
+      template_info = live_camera_info_;
+    }
+  }
+  if (!have_info) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *transport_node_->get_clock(), 3000,
+      "Waiting for CameraInfo (calib_source=%s meta_port=%d)",
+      cfg_.calib_source.c_str(), cfg_.meta_port);
+    return false;
+  }
+
   auto info = stamp_camera_info(
-    cfg_.camera_info, image_msg.header.stamp, width, height);
+    template_info, image_msg.header.stamp, width, height);
   info.header.frame_id = cfg_.frame_id;
 
   if (!first_frame_logged_) {
@@ -552,6 +622,78 @@ bool UdpStream::publish_sample(void * sample_ptr)
 
   cam_pub_.publish(image_msg, info);
   return true;
+}
+
+void UdpStream::apply_stream_calib(const CalibData & calib)
+{
+  auto info = camera_info_from_calib(calib, cfg_.frame_id);
+  {
+    std::lock_guard<std::mutex> lock(camera_info_mutex_);
+    live_camera_info_ = info;
+    have_camera_info_ = true;
+  }
+  size_logged_ = false;
+  if (!meta_logged_) {
+    RCLCPP_INFO(
+      logger_,
+      "CameraInfo from stream meta (%dx%d, model=%s)",
+      info.width, info.height, info.distortion_model.c_str());
+    meta_logged_ = true;
+  }
+}
+
+void UdpStream::meta_loop()
+{
+  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    RCLCPP_ERROR(logger_, "meta socket() failed");
+    return;
+  }
+  meta_fd_ = fd;
+
+  int yes = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(static_cast<uint16_t>(cfg_.meta_port));
+  if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    RCLCPP_ERROR(logger_, "meta bind 0.0.0.0:%d failed", cfg_.meta_port);
+    ::close(fd);
+    meta_fd_ = -1;
+    return;
+  }
+
+  // Make recv interruptible via shutdown() from stop().
+  timeval tv{};
+  tv.tv_sec = 0;
+  tv.tv_usec = 200000;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  RCLCPP_INFO(logger_, "Listening for UCAL1 CameraInfo on UDP port %d", cfg_.meta_port);
+
+  std::vector<char> buf(65536);
+  while (!stop_) {
+    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    if (n < 0) {
+      continue;
+    }
+    if (n == 0) {
+      continue;
+    }
+    try {
+      const std::string payload(buf.data(), static_cast<size_t>(n));
+      apply_stream_calib(parse_meta_payload(payload));
+    } catch (const std::exception & e) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *transport_node_->get_clock(), 5000,
+        "Ignoring bad meta packet: %s", e.what());
+    }
+  }
+
+  ::close(fd);
+  meta_fd_ = -1;
 }
 
 }  // namespace udp_camera_ros

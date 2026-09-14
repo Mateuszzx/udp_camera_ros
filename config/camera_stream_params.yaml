@@ -1,9 +1,11 @@
 camera_node:
   ros__parameters:
     port: 5000
+    meta_port: -1  # -1 → port+1 (UCAL1 sideband); 0 disables
     image_topic: "/camera/image_raw"
     frame_id: "camera_optical_frame"
-    # Basename under share/udp_camera_ros/config, absolute path, or package:// URL.
+    # auto = prefer stream meta, optional calib_file fallback
+    calib_source: "auto"
     calib_file: "example_calib.yaml"
     stream_undistorted: false
     udp_buffer_size: 212992

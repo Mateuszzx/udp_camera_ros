@@ -51,7 +51,32 @@ std::string resolve_calib_path(const std::string & path_or_name);
 CalibData load_calib(const std::string & path);
 
 /**
- * @brief Build a reusable CameraInfo template from calibration.
+ * @brief Parse a UCAL1 sideband UDP payload into @ref CalibData.
+ *
+ * Payload: magic `UCAL1\n` + JSON object with width/height/K/D/R/P
+ * (and optional stream_undistorted). JSON is accepted via yaml-cpp.
+ *
+ * @param payload Raw UDP datagram bytes.
+ * @param stream_undistorted_out Optional; set from JSON when present.
+ * @return Parsed calibration at stream resolution.
+ * @throws std::runtime_error on bad magic / JSON / sizes.
+ */
+CalibData parse_meta_payload(
+  const std::string & payload,
+  bool * stream_undistorted_out = nullptr);
+
+/**
+ * @brief Build CameraInfo directly from flat K/D/R/P (stream meta path).
+ *
+ * Unlike @ref build_camera_info, does not re-derive K from P — the sender
+ * already applied undistort / scale for the live resolution.
+ */
+sensor_msgs::msg::CameraInfo camera_info_from_calib(
+  const CalibData & calib,
+  const std::string & frame_id);
+
+/**
+ * @brief Build a reusable CameraInfo template from file calibration.
  *
  * When @p stream_undistorted is true (sender already remaps with OpenCV),
  * published K is taken from P's left 3x3 and D is zeroed so consumers do

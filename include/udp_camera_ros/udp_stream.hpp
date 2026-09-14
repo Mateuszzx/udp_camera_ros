@@ -10,6 +10,7 @@
 #include "image_transport/image_transport.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
+#include "udp_camera_ros/camera_info.hpp"
 
 namespace udp_camera_ros
 {
@@ -18,14 +19,20 @@ namespace udp_camera_ros
  * @brief Runtime settings for the UDP H.264 to ROS image bridge.
  *
  * Port / encoding must match the H.264 RTP sender (payload type 96).
- * CameraInfo is loaded from a local calibration file.
+ * CameraInfo comes from a local file and/or UCAL1 sideband meta on @ref meta_port.
  */
 struct UdpStreamConfig
 {
   int port{5000};  ///< UDP listen port (bind 0.0.0.0).
+  /// Sideband CameraInfo port; 0 = disable. Default callers use port+1.
+  int meta_port{5001};
   std::string image_topic{"/camera/image_raw"};  ///< Base image_transport topic.
   std::string frame_id{"camera_optical_frame"};
+  /// Initial CameraInfo (from file). May be empty when calib_source=stream.
   sensor_msgs::msg::CameraInfo camera_info;
+  bool have_camera_info{false};
+  /// file | stream | auto (prefer stream meta, keep file as fallback)
+  std::string calib_source{"auto"};
   int buffer_size{212992};
   int queue_size{1};
   std::string qos_reliability{"best_effort"};
@@ -140,11 +147,18 @@ private:
    */
   bool publish_sample(void * sample);
 
+  /** @brief Background UDP listener for UCAL1 CameraInfo sideband packets. */
+  void meta_loop();
+
+  /** @brief Apply parsed stream meta under @ref camera_info_mutex_. */
+  void apply_stream_calib(const CalibData & calib);
+
   rclcpp::Logger logger_;
   UdpStreamConfig cfg_;
   bool configured_{false};
   bool size_logged_{false};
   bool first_frame_logged_{false};
+  bool meta_logged_{false};
   std::string active_decoder_;
 
   /** Separate node so image_transport publishers do not clash with lifecycle rosout. */
@@ -154,8 +168,13 @@ private:
 
   std::unique_ptr<Pipeline> pipeline_;
   std::mutex pipeline_mutex_;
+  std::mutex camera_info_mutex_;
+  sensor_msgs::msg::CameraInfo live_camera_info_;
+  bool have_camera_info_{false};
   std::atomic<bool> stop_{true};
   std::thread grab_thread_;
+  std::thread meta_thread_;
+  int meta_fd_{-1};
 };
 
 }  // namespace udp_camera_ros

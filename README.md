@@ -20,9 +20,21 @@ ros2 launch udp_camera_ros camera_stream.launch.py \
   port:=5000
 ```
 
+### CameraInfo source (`calib_source`)
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | Use `calib_file` if set as fallback; prefer UCAL1 UDP meta when it arrives |
+| `stream` | Intrinsics **only** from sideband meta (`meta_port`, default `port+1`) |
+| `file` | Intrinsics only from `calib_file` |
+
+Pi sender (`camera_stream.sh`) emits UCAL1 JSON on `META_PORT` (default `GS_PORT+1`)
+via `calib_util.py meta-send`, already scaled to stream resolution and matching
+`UNDISTORT`.
+
 ### `calib_file`
 
-Accepts:
+Used for `file` / `auto` fallback. Accepts:
 
 - a basename under `share/udp_camera_ros/config/`
 - an absolute filesystem path
@@ -39,15 +51,13 @@ Accepts:
 
 ## Higher-resolution testing
 
-Receiver is sized for full IMX708 modes (e.g. 1536×864). Raise the sender
-without changing this package’s defaults, for example on the Pi:
-
 ```bash
+# Pi
 WIDTH=1536 HEIGHT=864 BITRATE=16000 ./scripts/drone/camera_stream.sh
-```
 
-Then confirm CameraInfo principal point is near image center and that
-lifecycle deactivate/activate recovers after a Wi-Fi gap.
+# GS — calib rides on the meta port automatically
+ros2 launch drone_bringup gs_bringup.launch.py
+```
 
 ## Dependencies
 
