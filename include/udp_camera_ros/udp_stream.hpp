@@ -10,6 +10,7 @@
 #include "image_transport/image_transport.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
+#include "sensor_msgs/msg/compressed_image.hpp"
 #include "udp_camera_ros/camera_info.hpp"
 
 namespace udp_camera_ros
@@ -42,8 +43,10 @@ struct UdpStreamConfig
   int read_timeout_ms{250};      ///< appsink pull timeout.
   /// auto | avdec_h264 | vah264dec | nvh264dec
   std::string h264_decoder{"auto"};
-  /// When false (default), only advertise /compressed (no raw Image topic).
+  /// When false (default), JPEG in GStreamer (I420→jpegenc); no raw Image.
   bool publish_raw{false};
+  /// jpegenc quality when publish_raw is false (1–100).
+  int jpeg_quality{80};
 
   /**
    * @brief Sanity-check port, queue_size, qos_reliability, and decoder.
@@ -53,26 +56,17 @@ struct UdpStreamConfig
 };
 
 /**
- * @brief Listen for H.264/RTP over UDP and republish via image_transport.
+ * @brief Listen for H.264/RTP over UDP and republish images + CameraInfo.
  *
- * Flow:
- * 1. @ref configure — create transport node, advertise CameraPublisher
- *    (raw + compressed + CameraInfo).
- * 2. @ref start — spawn grab thread; GStreamer PLAYING + appsink pull runs
- *    on the worker so lifecycle activate returns immediately.
- * 3. Grab loop maps BGR buffers into sensor_msgs/Image and publishes.
- *    On stall / ERROR / EOS the pipeline is torn down and rebuilt.
+ * Default (`publish_raw=false`): decode → I420 → jpegenc → CompressedImage
+ * on `image_topic/compressed` (skips BGR + OpenCV JPEG).
  *
- * Pipeline: udpsrc → rtpjitterbuffer → rtph264depay → h264parse →
- * decoder → videoconvert → appsink (drop=true, max-buffers=1).
+ * With `publish_raw=true`: decode → BGR → image_transport CameraPublisher
+ * (raw + compressed plugins).
  */
 class UdpStream
 {
 public:
-  /**
-   * @brief Construct a stream helper that logs through @p logger.
-   * @param logger Typically the lifecycle node's logger.
-   */
   explicit UdpStream(rclcpp::Logger logger);
 
   ~UdpStream();
@@ -80,80 +74,24 @@ public:
   UdpStream(const UdpStream &) = delete;
   UdpStream & operator=(const UdpStream &) = delete;
 
-  /**
-   * @brief Create the image_transport publishers (no UDP I/O yet).
-   *
-   * Whitelists only `raw` and `compressed` plugins so ffmpeg / depth /
-   * theora topics are not advertised.
-   *
-   * @param cfg Validated stream configuration (copied).
-   * @throws std::runtime_error if @ref UdpStreamConfig::validate fails.
-   */
   void configure(const UdpStreamConfig & cfg);
-
-  /**
-   * @brief Start the background grab thread.
-   *
-   * Returns immediately; pipeline PLAYING / first-packet wait runs on the
-   * worker so lifecycle activate is not blocked.
-   *
-   * @throws std::runtime_error if not configured or already running.
-   */
   void start();
-
-  /**
-   * @brief Signal the grab thread to exit, set pipeline to NULL, and join.
-   */
   void stop();
-
-  /**
-   * @brief @ref stop plus shutdown of CameraPublisher / transport node.
-   */
   void cleanup();
 
 private:
   struct Pipeline;
 
-  /**
-   * @brief List of decoder element names to try for @ref UdpStreamConfig::h264_decoder.
-   * @throws std::runtime_error if none of the candidates exist on this host.
-   */
   std::vector<std::string> decoder_candidates() const;
-
-  /**
-   * @brief Build the GStreamer pipeline launch string for @p decoder.
-   */
   std::string build_pipeline(const std::string & decoder) const;
-
-  /**
-   * @brief Create, PLAY, and return a pipeline; nullptr on failure.
-   */
   std::unique_ptr<Pipeline> open_pipeline(const std::string & decoder);
-
-  /** @brief Set pipeline to NULL (unblocks appsink pull) without destroying it. */
   void flush_pipeline();
-
-  /** @brief Destroy @ref pipeline_ (caller must not be pulling). */
   void close_pipeline();
-
-  /**
-   * @brief Worker: open pipeline, pull samples, republish until @ref stop_.
-   *
-   * Rebuilds after stall, ERROR, EOS, or failed open.
-   */
   void grab_loop();
-
-  /**
-   * @brief Map one BGR GstSample into Image + CameraInfo and publish.
-   * @return false if the sample could not be mapped / wrong format.
-   */
   bool publish_sample(void * sample);
-
-  /** @brief Background UDP listener for UCAL1 CameraInfo sideband packets. */
   void meta_loop();
-
-  /** @brief Apply parsed stream meta under @ref camera_info_mutex_. */
   void apply_stream_calib(const CalibData & calib);
+  void log_camera_info_once(const sensor_msgs::msg::CameraInfo & info);
 
   rclcpp::Logger logger_;
   UdpStreamConfig cfg_;
@@ -162,11 +100,13 @@ private:
   bool first_frame_logged_{false};
   bool meta_logged_{false};
   std::string active_decoder_;
+  std::string camera_info_topic_;
 
-  /** Separate node so image_transport publishers do not clash with lifecycle rosout. */
   rclcpp::Node::SharedPtr transport_node_;
   std::shared_ptr<image_transport::ImageTransport> it_;
   image_transport::CameraPublisher cam_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr info_pub_;
 
   std::unique_ptr<Pipeline> pipeline_;
   std::mutex pipeline_mutex_;

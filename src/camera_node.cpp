@@ -53,6 +53,7 @@ public:
     declare_parameter("read_timeout_ms", 250);
     declare_parameter("h264_decoder", "auto");
     declare_parameter("publish_raw", false);
+    declare_parameter("jpeg_quality", 80);
 
     RCLCPP_INFO(get_logger(), "Lifecycle: unconfigured");
   }

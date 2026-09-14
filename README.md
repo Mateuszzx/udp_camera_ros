@@ -1,10 +1,22 @@
 # udp_camera_ros
 
-ROS 2 lifecycle node that receives H.264/RTP over UDP and republishes via
-`image_transport` (raw + compressed) plus `sensor_msgs/CameraInfo`.
+ROS 2 lifecycle node that receives H.264/RTP over UDP and publishes
+`sensor_msgs/CompressedImage` (default) or raw `Image` via `image_transport`,
+plus `sensor_msgs/CameraInfo`.
 
 Decode uses **native GStreamer appsink** (no OpenCV `VideoCapture` / `cv_bridge`
 on the hot path). Prefer hardware H.264 when available.
+
+## Layout
+
+```
+include/udp_camera_ros/   public headers (Camera, UdpStream, calib helpers)
+src/
+  camera_node.cpp         lifecycle node entry
+  camera.cpp              param → UdpStreamConfig adapter
+  camera_info.cpp         YAML / UCAL1 calib parsing
+  stream/                 GStreamer receive / publish / meta
+```
 
 ## Launch
 
@@ -30,7 +42,9 @@ ros2 launch udp_camera_ros camera_stream.launch.py \
 
 Pi sender (`camera_stream.sh`) emits UCAL1 JSON on `META_PORT` (default `GS_PORT+1`)
 via `calib_util.py meta-send`, already scaled to stream resolution and matching
-`UNDISTORT`.
+`UNDISTORT`. Stream meta already carries correct K/D for the live image
+(`camera_info_from_calib`); file calib still uses `stream_undistorted` when
+loading YAML.
 
 ### `calib_file`
 
@@ -44,10 +58,10 @@ Used for `file` / `auto` fallback. Accepts:
 
 | Value | Behavior |
 |-------|----------|
-| `false` (default) | Advertise `/compressed` (+ CameraInfo) only |
-| `true` | Also advertise raw `sensor_msgs/Image` |
+| `false` (default) | GStreamer `I420 → jpegenc` → `image_topic/compressed` + `camera_info` |
+| `true` | Decode to BGR → `image_transport` CameraPublisher (raw + compressed plugins) |
 
-Consumers should use `image_transport:=compressed` (ArUco / YOLO / detection).
+`jpeg_quality` (1–100, default 80) applies to the GStreamer `jpegenc` path.
 
 ### `h264_decoder`
 

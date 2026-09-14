@@ -19,3 +19,4 @@ camera_node:
     h264_decoder: "auto"
     # false = advertise /compressed only (recommended)
     publish_raw: false
+    jpeg_quality: 80

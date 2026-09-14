@@ -5,8 +5,9 @@
   <version>0.1.0</version>
   <description>
     Ground-station UDP H.264/RTP lifecycle receiver (C++). Native GStreamer
-    appsink decode; publishes via image_transport::CameraPublisher
-    (raw + compressed_image_transport).
+    appsink decode; default path publishes CompressedImage via GStreamer
+    jpegenc (I420→JPEG). Optional publish_raw uses image_transport
+    CameraPublisher (raw + compressed_image_transport).
   </description>
   <maintainer email="mateuszwojcikv@gmail.com">drone</maintainer>
   <license>Apache-2.0</license>

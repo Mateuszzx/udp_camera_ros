@@ -42,6 +42,7 @@ void Camera::configure()
   cfg.read_timeout_ms = static_cast<int>(node_->get_parameter("read_timeout_ms").as_int());
   cfg.h264_decoder = node_->get_parameter("h264_decoder").as_string();
   cfg.publish_raw = node_->get_parameter("publish_raw").as_bool();
+  cfg.jpeg_quality = static_cast<int>(node_->get_parameter("jpeg_quality").as_int());
 
   const bool want_file =
     calib_source == "file" ||

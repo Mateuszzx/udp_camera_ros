@@ -20,13 +20,21 @@ pkg_check_modules(GSTREAMER_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
 add_executable(camera_node
   src/camera_node.cpp
   src/camera.cpp
-  src/udp_stream.cpp
   src/camera_info.cpp
+  src/stream/gst_utils.cpp
+  src/stream/udp_stream.cpp
+  src/stream/udp_stream_pipeline.cpp
+  src/stream/udp_stream_publish.cpp
+  src/stream/udp_stream_meta.cpp
 )
 
 target_include_directories(camera_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+)
+# Private headers for stream/ translation units (pipeline.hpp, gst_utils.hpp).
+target_include_directories(camera_node PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/stream
 )
 target_compile_features(camera_node PUBLIC cxx_std_17)
 

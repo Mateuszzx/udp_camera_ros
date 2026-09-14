@@ -54,16 +54,14 @@ CalibData load_calib(const std::string & path);
  * @brief Parse a UCAL1 sideband UDP payload into @ref CalibData.
  *
  * Payload: magic `UCAL1\n` + JSON object with width/height/K/D/R/P
- * (and optional stream_undistorted). JSON is accepted via yaml-cpp.
+ * (optional `stream_undistorted` is ignored — K/D are already stream-correct).
+ * JSON is accepted via yaml-cpp.
  *
  * @param payload Raw UDP datagram bytes.
- * @param stream_undistorted_out Optional; set from JSON when present.
  * @return Parsed calibration at stream resolution.
  * @throws std::runtime_error on bad magic / JSON / sizes.
  */
-CalibData parse_meta_payload(
-  const std::string & payload,
-  bool * stream_undistorted_out = nullptr);
+CalibData parse_meta_payload(const std::string & payload);
 
 /**
  * @brief Build CameraInfo directly from flat K/D/R/P (stream meta path).

@@ -113,9 +113,7 @@ std::vector<double> json_array(const YAML::Node & node, const char * key, size_t
 
 }  // namespace
 
-CalibData parse_meta_payload(
-  const std::string & payload,
-  bool * stream_undistorted_out)
+CalibData parse_meta_payload(const std::string & payload)
 {
   constexpr std::string_view kMagic = "UCAL1\n";
   if (payload.size() < kMagic.size() ||
@@ -139,9 +137,6 @@ CalibData parse_meta_payload(
   calib.P = json_array(doc, "P", 12);
   if (calib.D.size() < 4) {
     throw std::runtime_error("meta D too short");
-  }
-  if (stream_undistorted_out && doc["stream_undistorted"]) {
-    *stream_undistorted_out = doc["stream_undistorted"].as<bool>();
   }
   return calib;
 }
