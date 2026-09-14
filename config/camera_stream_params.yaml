@@ -1,0 +1,16 @@
+camera_node:
+  ros__parameters:
+    port: 5000
+    image_topic: "/camera/image_raw"
+    camera_info_topic: "/camera/camera_info"
+    frame_id: "camera_optical_frame"
+    # Basename under share/udp_camera_ros/config, absolute path, or package:// URL.
+    calib_file: "example_calib.yaml"
+    stream_undistorted: false
+    udp_buffer_size: 212992
+    queue_size: 1
+    qos_reliability: "best_effort"
+    jitter_latency_ms: 80
+    stall_timeout_ms: 1500
+    reconnect_delay_ms: 400
+    read_timeout_ms: 250
