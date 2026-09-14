@@ -9,12 +9,13 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(compressed_image_transport REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
-find_package(OpenCV REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET gstreamer-1.0)
+pkg_check_modules(GSTREAMER_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
 
 add_executable(camera_node
   src/camera_node.cpp
@@ -27,20 +28,22 @@ target_include_directories(camera_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_include_directories(camera_node SYSTEM PUBLIC ${OpenCV_INCLUDE_DIRS})
 target_compile_features(camera_node PUBLIC cxx_std_17)
 
 ament_target_dependencies(camera_node
   rclcpp
   rclcpp_lifecycle
   sensor_msgs
-  cv_bridge
   image_transport
   compressed_image_transport
   ament_index_cpp
   yaml_cpp_vendor
 )
-target_link_libraries(camera_node ${OpenCV_LIBRARIES} yaml-cpp)
+target_link_libraries(camera_node
+  yaml-cpp
+  PkgConfig::GSTREAMER
+  PkgConfig::GSTREAMER_APP
+)
 
 install(TARGETS camera_node
   DESTINATION lib/${PROJECT_NAME})

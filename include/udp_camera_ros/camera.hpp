@@ -39,7 +39,7 @@ public:
    */
   void start();
 
-  /** @brief Stop the grab thread and release the VideoCapture. */
+  /** @brief Stop the grab thread and tear down the GStreamer pipeline. */
   void stop();
 
   /**

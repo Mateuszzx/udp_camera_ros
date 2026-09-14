@@ -1,24 +1,79 @@
 /**
  * @file udp_stream.cpp
- * @brief @ref udp_camera_ros::UdpStream implementation.
+ * @brief Native GStreamer appsink implementation of @ref udp_camera_ros::UdpStream.
  */
 
 #include "udp_camera_ros/udp_stream.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include <gst/app/gstappsink.h>
+#include <gst/gst.h>
+
 #include "udp_camera_ros/camera_info.hpp"
-#include "rclcpp/qos.hpp"
 #include "sensor_msgs/image_encodings.hpp"
+#include "sensor_msgs/msg/image.hpp"
 
 namespace udp_camera_ros
 {
+namespace
+{
+
+std::once_flag g_gst_once;
+
+void ensure_gst_init()
+{
+  std::call_once(g_gst_once, []() {
+    GError * err = nullptr;
+    if (!gst_init_check(nullptr, nullptr, &err)) {
+      const std::string msg = err ? err->message : "gst_init_check failed";
+      if (err) {
+        g_error_free(err);
+      }
+      throw std::runtime_error(msg);
+    }
+  });
+}
+
+bool factory_exists(const char * name)
+{
+  GstElementFactory * factory = gst_element_factory_find(name);
+  if (!factory) {
+    return false;
+  }
+  gst_object_unref(factory);
+  return true;
+}
+
+}  // namespace
+
+struct UdpStream::Pipeline
+{
+  GstElement * pipeline{nullptr};
+  GstElement * appsink{nullptr};
+
+  ~Pipeline()
+  {
+    if (pipeline) {
+      gst_element_set_state(pipeline, GST_STATE_NULL);
+    }
+    if (appsink) {
+      gst_object_unref(appsink);
+      appsink = nullptr;
+    }
+    if (pipeline) {
+      gst_object_unref(pipeline);
+      pipeline = nullptr;
+    }
+  }
+};
 
 void UdpStreamConfig::validate() const
 {
@@ -44,6 +99,13 @@ void UdpStreamConfig::validate() const
   if (read_timeout_ms < 1) {
     throw std::runtime_error("read_timeout_ms must be >= 1");
   }
+  if (h264_decoder != "auto" && h264_decoder != "avdec_h264" &&
+    h264_decoder != "vah264dec" && h264_decoder != "nvh264dec")
+  {
+    throw std::runtime_error(
+            "h264_decoder must be auto|avdec_h264|vah264dec|nvh264dec (got '" +
+            h264_decoder + "')");
+  }
 }
 
 UdpStream::UdpStream(rclcpp::Logger logger)
@@ -51,24 +113,38 @@ UdpStream::UdpStream(rclcpp::Logger logger)
 {
 }
 
-/**
- * Build the OpenCV CAP_GSTREAMER pipeline string.
- *
- * Each `!` is a GStreamer link. Left -> right = data flow:
- *
- *   udpsrc          listen for RTP on cfg_.port (all interfaces)
- *   rtpjitterbuffer reorder buffer; drop late packets (Wi-Fi jitter)
- *   rtph264depay    RTP -> H.264 NALs; wait-for-keyframe after loss
- *   h264parse       insert SPS/PPS before each IDR (decoder resync)
- *   avdec_h264      software H.264 decode (needs gstreamer1.0-libav)
- *   videoconvert    to BGR for OpenCV / cv_bridge
- *   appsink         hand frames to OpenCV (keep only newest: drop -> max-buffers=1)
- *
- * Important: udpsrc makes VideoCapture::open() block until the first UDP
- * packet arrives. That open runs inside grab_loop() on a background thread
- * so lifecycle activate() can return immediately.
- */
-std::string UdpStream::build_pipeline() const
+UdpStream::~UdpStream()
+{
+  cleanup();
+}
+
+std::vector<std::string> UdpStream::decoder_candidates() const
+{
+  ensure_gst_init();
+
+  const std::vector<std::string> preferred = [&]() {
+    if (cfg_.h264_decoder == "auto") {
+      return std::vector<std::string>{"vah264dec", "nvh264dec", "avdec_h264"};
+    }
+    return std::vector<std::string>{cfg_.h264_decoder};
+  }();
+
+  std::vector<std::string> available;
+  for (const auto & name : preferred) {
+    if (factory_exists(name.c_str())) {
+      available.push_back(name);
+    } else {
+      RCLCPP_WARN(logger_, "H.264 decoder '%s' not available on this host", name.c_str());
+    }
+  }
+  if (available.empty()) {
+    throw std::runtime_error(
+            "no usable H.264 decoder (wanted '" + cfg_.h264_decoder + "')");
+  }
+  return available;
+}
+
+std::string UdpStream::build_pipeline(const std::string & decoder) const
 {
   return
     "udpsrc address=0.0.0.0 port=" + std::to_string(cfg_.port) +
@@ -79,29 +155,81 @@ std::string UdpStream::build_pipeline() const
     "rtpjitterbuffer latency=" + std::to_string(cfg_.jitter_latency_ms) +
     " drop-on-latency=true do-lost=true ! "
     "rtph264depay wait-for-keyframe=true ! "
-    "h264parse config-interval=-1 ! "
-    "avdec_h264 ! "
+    "h264parse config-interval=-1 ! " +
+    decoder + " ! "
     "videoconvert ! video/x-raw,format=BGR ! "
-    "appsink drop=true max-buffers=1 sync=false";
+    "appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true";
 }
 
-/**
- * Prepare ROS publishers. Does NOT open the UDP socket yet.
- *
- * Why a second node ("camera_transport")?
- *   image_transport needs an rclcpp::Node. Reusing the lifecycle node name
- *   would collide on /rosout, so we use a dedicated helper node.
- *
- * Why enable_pub_plugins?
- *   By default every installed transport plugin advertises a topic
- *   (ffmpeg, compressedDepth, ...). We only want raw + JPEG compressed.
- */
+std::unique_ptr<UdpStream::Pipeline> UdpStream::open_pipeline(const std::string & decoder)
+{
+  ensure_gst_init();
+
+  const std::string launch = build_pipeline(decoder);
+  RCLCPP_DEBUG(logger_, "Pipeline: %s", launch.c_str());
+
+  GError * err = nullptr;
+  GstElement * pipeline = gst_parse_launch(launch.c_str(), &err);
+  if (!pipeline) {
+    const std::string msg = err ? err->message : "gst_parse_launch failed";
+    if (err) {
+      g_error_free(err);
+    }
+    RCLCPP_ERROR(logger_, "Failed to create pipeline: %s", msg.c_str());
+    return nullptr;
+  }
+  if (err) {
+    RCLCPP_WARN(logger_, "Pipeline parse warning: %s", err->message);
+    g_error_free(err);
+  }
+
+  GstElement * appsink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+  if (!appsink) {
+    RCLCPP_ERROR(logger_, "Pipeline missing appsink named 'sink'");
+    gst_object_unref(pipeline);
+    return nullptr;
+  }
+
+  // Pull mode: we drive the clock via try_pull_sample timeouts.
+  gst_app_sink_set_max_buffers(GST_APP_SINK(appsink), 1);
+  gst_app_sink_set_drop(GST_APP_SINK(appsink), TRUE);
+
+  const GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    RCLCPP_ERROR(logger_, "Failed to set pipeline to PLAYING");
+    gst_object_unref(appsink);
+    gst_object_unref(pipeline);
+    return nullptr;
+  }
+
+  auto out = std::make_unique<Pipeline>();
+  out->pipeline = pipeline;
+  out->appsink = appsink;
+  return out;
+}
+
+void UdpStream::flush_pipeline()
+{
+  std::lock_guard<std::mutex> lock(pipeline_mutex_);
+  if (pipeline_ && pipeline_->pipeline) {
+    gst_element_set_state(pipeline_->pipeline, GST_STATE_NULL);
+  }
+}
+
+void UdpStream::close_pipeline()
+{
+  std::lock_guard<std::mutex> lock(pipeline_mutex_);
+  pipeline_.reset();
+}
+
 void UdpStream::configure(const UdpStreamConfig & cfg)
 {
   cfg.validate();
   cfg_ = cfg;
+  size_logged_ = false;
+  first_frame_logged_ = false;
+  active_decoder_.clear();
 
-  // Helper node for image_transport (not spun - publishing does not need spin).
   transport_node_ = std::make_shared<rclcpp::Node>(
     "camera_transport",
     rclcpp::NodeOptions().use_global_arguments(false));
@@ -120,9 +248,6 @@ void UdpStream::configure(const UdpStreamConfig & cfg)
       "image_transport/compressed",
     });
 
-  // CameraPublisher = Image (all enabled transports) + sibling CameraInfo.
-  // Best-effort matches ArUco / HSV / YOLO (SensorDataQoS) and skips DDS
-  // retransmission of stale live video.
   it_ = std::make_shared<image_transport::ImageTransport>(transport_node_);
   rmw_qos_profile_t qos = cfg_.qos_reliability == "best_effort"
     ? rmw_qos_profile_sensor_data
@@ -138,21 +263,15 @@ void UdpStream::configure(const UdpStreamConfig & cfg)
     cfg_.port, cfg_.image_topic.c_str(), cam_pub_.getInfoTopic().c_str());
   RCLCPP_INFO(
     logger_,
-    "Start sender AFTER activate. Example: udpsink host=<this-host-ip> port=%d sync=false -> %s",
-    cfg_.port, cfg_.image_topic.c_str());
+    "Start sender AFTER activate. Example: udpsink host=<this-host-ip> port=%d sync=false",
+    cfg_.port);
   RCLCPP_INFO(
     logger_,
-    "Stream recovery: qos=%s jitter=%dms stall=%dms reconnect=%dms read-timeout=%dms",
-    cfg_.qos_reliability.c_str(), cfg_.jitter_latency_ms,
+    "Stream recovery: qos=%s decoder=%s jitter=%dms stall=%dms reconnect=%dms read-timeout=%dms",
+    cfg_.qos_reliability.c_str(), cfg_.h264_decoder.c_str(), cfg_.jitter_latency_ms,
     cfg_.stall_timeout_ms, cfg_.reconnect_delay_ms, cfg_.read_timeout_ms);
 }
 
-/**
- * Kick off the background receiver. Returns right away.
- *
- * The actual GStreamer open + frame loop lives in grab_loop().
- * Call this from lifecycle on_activate().
- */
 void UdpStream::start()
 {
   if (!configured_) {
@@ -170,29 +289,13 @@ void UdpStream::start()
     cfg_.port);
 }
 
-/**
- * Ask grab_loop() to exit and wait for it.
- *
- * Trick: if VideoCapture is stuck in open()/read() waiting for UDP, we
- * release() it from this thread so GStreamer unblocks and the worker can
- * notice stop_ == true.
- */
-void UdpStream::release_capture()
-{
-  // No lock around release(): grab_loop may be blocked in open()/read() and
-  // GStreamer unblocks appsink when the pipeline is torn down.
-  if (cap_.isOpened()) {
-    cap_.release();
-  }
-}
-
 void UdpStream::stop()
 {
   stop_ = true;
-  release_capture();
+  // Unblock try_pull_sample without destroying elements the worker still holds.
+  flush_pipeline();
 
   if (grab_thread_.joinable()) {
-    // Never join ourselves (would deadlock if somehow called from grab thread).
     if (grab_thread_.get_id() != std::this_thread::get_id()) {
       grab_thread_.join();
     } else {
@@ -200,117 +303,151 @@ void UdpStream::stop()
     }
   }
 
-  release_capture();
+  close_pipeline();
 }
 
-/** stop() + tear down image_transport so configure() can run again. */
 void UdpStream::cleanup()
 {
   stop();
-  cam_pub_.shutdown();
-  it_.reset();
-  transport_node_.reset();
-  configured_ = false;
+  if (configured_) {
+    cam_pub_.shutdown();
+    it_.reset();
+    transport_node_.reset();
+    configured_ = false;
+  }
 }
 
-/**
- * Worker thread body.
- *
- * Outer loop reopens the pipeline after a failed open, a dead decoder, or a
- * stall (no frame for stall_timeout_ms). Inner loop reads until stop_ or stall.
- *
- * Phase 1 - open:  VideoCapture(pipeline) blocks until first RTP packet
- *                  (or until stop() releases the capture).
- * Phase 2 - loop:  read BGR frames and publish until stop_ or stall.
- */
 void UdpStream::grab_loop()
 {
-  const std::string pipeline = build_pipeline();
-  rclcpp::Clock clock(RCL_ROS_TIME);
   int attempt = 0;
 
   while (!stop_) {
     ++attempt;
-    if (attempt == 1) {
-      RCLCPP_INFO(logger_, "Opening GStreamer pipeline (blocks until first UDP packet)...");
-    } else {
-      RCLCPP_WARN(logger_, "Reopening GStreamer pipeline (attempt %d)...", attempt);
-    }
-    RCLCPP_DEBUG(logger_, "Pipeline: %s", pipeline.c_str());
 
-    cv::VideoCapture cap;
-    if (!cap.open(pipeline, cv::CAP_GSTREAMER)) {
-      if (stop_) {
-        return;
-      }
-      RCLCPP_ERROR(
-        logger_, "GStreamer open failed — retry in %d ms", cfg_.reconnect_delay_ms);
+    std::vector<std::string> candidates;
+    try {
+      candidates = decoder_candidates();
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(logger_, "%s — retry in %d ms", e.what(), cfg_.reconnect_delay_ms);
       std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.reconnect_delay_ms));
       continue;
     }
 
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-    // Unblock read() so a Wi-Fi gap can be detected instead of hanging forever.
-    cap.set(cv::CAP_PROP_READ_TIMEOUT_MSEC, cfg_.read_timeout_ms);
+    if (attempt == 1) {
+      RCLCPP_INFO(logger_, "Opening GStreamer pipeline (waits for first UDP packet)...");
+    } else {
+      RCLCPP_WARN(logger_, "Reopening GStreamer pipeline (attempt %d)...", attempt);
+    }
+
+    std::unique_ptr<Pipeline> pipeline;
+    std::string decoder;
+    for (const auto & name : candidates) {
+      pipeline = open_pipeline(name);
+      if (pipeline) {
+        decoder = name;
+        break;
+      }
+      RCLCPP_WARN(logger_, "Decoder '%s' failed to start — trying next", name.c_str());
+    }
+
+    if (!pipeline) {
+      if (stop_) {
+        return;
+      }
+      RCLCPP_ERROR(
+        logger_, "GStreamer open failed for all decoders — retry in %d ms",
+        cfg_.reconnect_delay_ms);
+      std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.reconnect_delay_ms));
+      continue;
+    }
+
+    if (active_decoder_ != decoder) {
+      active_decoder_ = decoder;
+      RCLCPP_INFO(logger_, "Using H.264 decoder: %s", decoder.c_str());
+    }
 
     {
-      std::lock_guard<std::mutex> lock(cap_mutex_);
-      cap_ = std::move(cap);
+      std::lock_guard<std::mutex> lock(pipeline_mutex_);
+      pipeline_ = std::move(pipeline);
     }
-    RCLCPP_INFO(logger_, "GStreamer pipeline open - reading frames");
+    RCLCPP_INFO(logger_, "GStreamer pipeline PLAYING — pulling frames");
 
     bool waiting_logged = false;
-    std::atomic<bool> got_frame{false};
     auto last_frame_at = std::chrono::steady_clock::now();
-    std::atomic<bool> session_live{true};
-    std::atomic<long> last_frame_ms{0};
-    const auto session_start = last_frame_at;
+    bool got_frame = false;
+    const guint64 pull_timeout_ns =
+      static_cast<guint64>(cfg_.read_timeout_ms) * GST_MSECOND;
 
-    // Unblock a hung read() if OpenCV ignores READ_TIMEOUT_MSEC.
-    std::thread watchdog([this, &session_live, &last_frame_ms, &got_frame, session_start]() {
-      while (session_live.load() && !stop_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (!got_frame.load()) {
-          continue;
-        }
-        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - session_start).count();
-        const auto age = now_ms - last_frame_ms.load();
-        if (age >= cfg_.stall_timeout_ms) {
-          RCLCPP_WARN(
-            logger_, "Watchdog: no video for %ld ms — restarting decoder",
-            static_cast<long>(age));
-          release_capture();
+    bool need_reopen = false;
+    while (!stop_ && !need_reopen) {
+      GstElement * appsink = nullptr;
+      GstElement * pipe = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(pipeline_mutex_);
+        if (!pipeline_) {
           break;
         }
+        appsink = pipeline_->appsink;
+        pipe = pipeline_->pipeline;
       }
-    });
 
-    while (!stop_ && cap_.isOpened()) {
-      cv::Mat frame;
-      const bool ok = cap_.read(frame);
-
-      if (ok && !frame.empty()) {
-        if (!got_frame.exchange(true)) {
-          RCLCPP_INFO(
-            logger_, "First frame received: %dx%d", frame.cols, frame.rows);
+      GstBus * bus = gst_element_get_bus(pipe);
+      while (true) {
+        GstMessage * msg = gst_bus_pop_filtered(
+          bus, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+        if (!msg) {
+          break;
         }
-        waiting_logged = false;
-        last_frame_at = std::chrono::steady_clock::now();
-        last_frame_ms.store(
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-            last_frame_at - session_start).count());
-        publish_frame(frame);
+        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+          GError * err = nullptr;
+          gchar * dbg = nullptr;
+          gst_message_parse_error(msg, &err, &dbg);
+          RCLCPP_ERROR(
+            logger_, "GStreamer error: %s (%s)",
+            err ? err->message : "unknown", dbg ? dbg : "");
+          if (err) {
+            g_error_free(err);
+          }
+          g_free(dbg);
+          need_reopen = true;
+        } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS) {
+          RCLCPP_WARN(logger_, "GStreamer EOS — reopening");
+          need_reopen = true;
+        }
+        gst_message_unref(msg);
+      }
+      gst_object_unref(bus);
+      if (need_reopen) {
+        break;
+      }
+
+      GstSample * sample = gst_app_sink_try_pull_sample(
+        GST_APP_SINK(appsink), pull_timeout_ns);
+
+      if (sample) {
+        const bool ok = publish_sample(sample);
+        gst_sample_unref(sample);
+        if (ok) {
+          got_frame = true;
+          waiting_logged = false;
+          last_frame_at = std::chrono::steady_clock::now();
+        }
         continue;
       }
 
-      if (stop_ || !cap_.isOpened()) {
+      if (stop_) {
+        break;
+      }
+
+      // NULL sample: timeout, EOS, or flushed sink after close_pipeline().
+      if (gst_app_sink_is_eos(GST_APP_SINK(appsink))) {
+        RCLCPP_WARN(logger_, "appsink EOS — reopening");
         break;
       }
 
       const auto stalled_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - last_frame_at).count();
-      if (got_frame.load() && stalled_ms >= cfg_.stall_timeout_ms) {
+      if (got_frame && stalled_ms >= cfg_.stall_timeout_ms) {
         RCLCPP_WARN(
           logger_,
           "No video for %ld ms — restarting decoder",
@@ -321,49 +458,77 @@ void UdpStream::grab_loop()
       if (!waiting_logged) {
         RCLCPP_WARN(logger_, "Waiting for incoming H.264/RTP packets...");
         waiting_logged = true;
-      } else {
-        RCLCPP_WARN_THROTTLE(
-          logger_, clock, 3000, "Waiting for incoming video packets...");
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    session_live = false;
-    if (watchdog.joinable()) {
-      watchdog.join();
-    }
-    release_capture();
+    close_pipeline();
     if (!stop_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.reconnect_delay_ms));
     }
   }
 }
 
-/**
- * One decoded BGR Mat -> sensor_msgs/Image + CameraInfo on cam_pub_.
- *
- * CameraInfo intrinsics come from local calib YAML (cfg_.camera_info);
- * only the stamp / size are updated per frame. Video never carries calib.
- */
-void UdpStream::publish_frame(const cv::Mat & frame)
+bool UdpStream::publish_sample(void * sample_ptr)
 {
-  if (!configured_ || !transport_node_) {
-    return;
+  if (!configured_ || !transport_node_ || !sample_ptr) {
+    return false;
   }
 
-  std_msgs::msg::Header header;
-  header.stamp = transport_node_->get_clock()->now();
-  header.frame_id = cfg_.frame_id;
+  GstSample * sample = static_cast<GstSample *>(sample_ptr);
+  GstBuffer * buffer = gst_sample_get_buffer(sample);
+  GstCaps * caps = gst_sample_get_caps(sample);
+  if (!buffer || !caps) {
+    return false;
+  }
 
-  // OpenCV BGR8 -> ROS Image (plugins may also emit /compressed on demand).
-  cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, frame);
-  auto image_msg = cv_img.toImageMsg();
+  const GstStructure * s = gst_caps_get_structure(caps, 0);
+  int width = 0;
+  int height = 0;
+  if (!s ||
+    !gst_structure_get_int(s, "width", &width) ||
+    !gst_structure_get_int(s, "height", &height) ||
+    width <= 0 || height <= 0)
+  {
+    return false;
+  }
 
-  auto info = stamp_camera_info(cfg_.camera_info, header.stamp, frame.cols, frame.rows);
+  GstMapInfo map;
+  if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+    return false;
+  }
+
+  const size_t expected = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+  if (map.size < expected) {
+    RCLCPP_ERROR_THROTTLE(
+      logger_, *transport_node_->get_clock(), 5000,
+      "Unexpected buffer size %zu (want >= %zu for %dx%d BGR)",
+      map.size, expected, width, height);
+    gst_buffer_unmap(buffer, &map);
+    return false;
+  }
+
+  sensor_msgs::msg::Image image_msg;
+  image_msg.header.stamp = transport_node_->get_clock()->now();
+  image_msg.header.frame_id = cfg_.frame_id;
+  image_msg.height = static_cast<uint32_t>(height);
+  image_msg.width = static_cast<uint32_t>(width);
+  image_msg.encoding = sensor_msgs::image_encodings::BGR8;
+  image_msg.is_bigendian = false;
+  image_msg.step = static_cast<uint32_t>(width * 3);
+  image_msg.data.resize(expected);
+  std::memcpy(image_msg.data.data(), map.data, expected);
+  gst_buffer_unmap(buffer, &map);
+
+  auto info = stamp_camera_info(
+    cfg_.camera_info, image_msg.header.stamp, width, height);
   info.header.frame_id = cfg_.frame_id;
 
-  static bool size_logged = false;
-  if (!size_logged) {
+  if (!first_frame_logged_) {
+    RCLCPP_INFO(logger_, "First frame received: %dx%d", width, height);
+    first_frame_logged_ = true;
+  }
+
+  if (!size_logged_) {
     const double cx = info.k[2];
     const double cy = info.k[5];
     RCLCPP_INFO(
@@ -382,10 +547,11 @@ void UdpStream::publish_frame(const cv::Mat & frame)
         "calib resolution does not match the stream (landmarks will be offset)",
         cx, cy, info.width, info.height);
     }
-    size_logged = true;
+    size_logged_ = true;
   }
 
-  cam_pub_.publish(*image_msg, info);
+  cam_pub_.publish(image_msg, info);
+  return true;
 }
 
 }  // namespace udp_camera_ros

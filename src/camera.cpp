@@ -45,6 +45,7 @@ void Camera::configure()
   cfg.stall_timeout_ms = static_cast<int>(node_->get_parameter("stall_timeout_ms").as_int());
   cfg.reconnect_delay_ms = static_cast<int>(node_->get_parameter("reconnect_delay_ms").as_int());
   cfg.read_timeout_ms = static_cast<int>(node_->get_parameter("read_timeout_ms").as_int());
+  cfg.h264_decoder = node_->get_parameter("h264_decoder").as_string();
 
   stream_ = std::make_unique<UdpStream>(node_->get_logger());
   stream_->configure(cfg);

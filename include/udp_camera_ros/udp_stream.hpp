@@ -5,10 +5,9 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
-#include "cv_bridge/cv_bridge.hpp"
 #include "image_transport/image_transport.hpp"
-#include "opencv2/videoio.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
 
@@ -33,15 +32,16 @@ struct UdpStreamConfig
   int jitter_latency_ms{80};     ///< rtpjitterbuffer latency (Wi-Fi reorder).
   int stall_timeout_ms{1500};    ///< Reopen decoder after this long with no frame.
   int reconnect_delay_ms{400};   ///< Pause between pipeline open attempts.
-  int read_timeout_ms{250};      ///< OpenCV GStreamer pull timeout.
+  int read_timeout_ms{250};      ///< appsink pull timeout.
+  /// auto | avdec_h264 | vah264dec | nvh264dec
+  std::string h264_decoder{"auto"};
 
   /**
-   * @brief Sanity-check port, queue_size, and qos_reliability.
+   * @brief Sanity-check port, queue_size, qos_reliability, and decoder.
    * @throws std::runtime_error if any field is invalid.
    */
   void validate() const;
 };
-
 
 /**
  * @brief Listen for H.264/RTP over UDP and republish via image_transport.
@@ -49,12 +49,13 @@ struct UdpStreamConfig
  * Flow:
  * 1. @ref configure — create transport node, advertise CameraPublisher
  *    (raw + compressed + CameraInfo).
- * 2. @ref start — spawn grab thread; OpenCV `VideoCapture` open blocks until
- *    the first RTP packet (activate itself returns immediately).
- * 3. Grab loop decodes BGR frames and publishes Image + CameraInfo.
- *    If the decoder stalls (Wi-Fi gap / lost IDR) the pipeline is reopened.
+ * 2. @ref start — spawn grab thread; GStreamer PLAYING + appsink pull runs
+ *    on the worker so lifecycle activate returns immediately.
+ * 3. Grab loop maps BGR buffers into sensor_msgs/Image and publishes.
+ *    On stall / ERROR / EOS the pipeline is torn down and rebuilt.
  *
- * Matches the drone GStreamer sender: udpsrc → depay → avdec_h264 → appsink.
+ * Pipeline: udpsrc → rtpjitterbuffer → rtph264depay → h264parse →
+ * decoder → videoconvert → appsink (drop=true, max-buffers=1).
  */
 class UdpStream
 {
@@ -64,6 +65,11 @@ public:
    * @param logger Typically the lifecycle node's logger.
    */
   explicit UdpStream(rclcpp::Logger logger);
+
+  ~UdpStream();
+
+  UdpStream(const UdpStream &) = delete;
+  UdpStream & operator=(const UdpStream &) = delete;
 
   /**
    * @brief Create the image_transport publishers (no UDP I/O yet).
@@ -79,18 +85,15 @@ public:
   /**
    * @brief Start the background grab thread.
    *
-   * Returns immediately; GStreamer `udpsrc` open runs on the worker thread
-   * so lifecycle activate is not blocked waiting for the first packet.
+   * Returns immediately; pipeline PLAYING / first-packet wait runs on the
+   * worker so lifecycle activate is not blocked.
    *
    * @throws std::runtime_error if not configured or already running.
    */
   void start();
 
   /**
-   * @brief Signal the grab thread to exit and join it.
-   *
-   * Releases `VideoCapture` from this thread so a blocked `open()`/`read()`
-   * can unblock when the sender is gone or deactivate is requested.
+   * @brief Signal the grab thread to exit, set pipeline to NULL, and join.
    */
   void stop();
 
@@ -100,48 +103,58 @@ public:
   void cleanup();
 
 private:
-  /**
-   * @brief Build the OpenCV CAP_GSTREAMER pipeline string for @ref cfg_.
-   * @return Pipeline ending in BGR appsink (drop=true, max-buffers=1).
-   */
-  std::string build_pipeline() const;
+  struct Pipeline;
 
   /**
-   * @brief Worker: open pipeline (may block), then read + publish until @ref stop_.
+   * @brief List of decoder element names to try for @ref UdpStreamConfig::h264_decoder.
+   * @throws std::runtime_error if none of the candidates exist on this host.
+   */
+  std::vector<std::string> decoder_candidates() const;
+
+  /**
+   * @brief Build the GStreamer pipeline launch string for @p decoder.
+   */
+  std::string build_pipeline(const std::string & decoder) const;
+
+  /**
+   * @brief Create, PLAY, and return a pipeline; nullptr on failure.
+   */
+  std::unique_ptr<Pipeline> open_pipeline(const std::string & decoder);
+
+  /** @brief Set pipeline to NULL (unblocks appsink pull) without destroying it. */
+  void flush_pipeline();
+
+  /** @brief Destroy @ref pipeline_ (caller must not be pulling). */
+  void close_pipeline();
+
+  /**
+   * @brief Worker: open pipeline, pull samples, republish until @ref stop_.
    *
-   * On open failure, empty reads, or a stall longer than @ref
-   * UdpStreamConfig::stall_timeout_ms the pipeline is released and reopened
-   * so a lost IDR / dead decoder does not freeze the ROS image topic.
+   * Rebuilds after stall, ERROR, EOS, or failed open.
    */
   void grab_loop();
 
   /**
-   * @brief Release @ref cap_ so a blocked @c read() / @c open() can return.
-   *
-   * Safe to call from @ref stop or the grab thread. Concurrent with @c read()
-   * is intentional — GStreamer unblocks @c appsink pull when the pipeline
-   * goes to NULL.
+   * @brief Map one BGR GstSample into Image + CameraInfo and publish.
+   * @return false if the sample could not be mapped / wrong format.
    */
-  void release_capture();
-
-  /**
-   * @brief Convert one BGR frame to Image + stamped CameraInfo and publish.
-   * @param frame OpenCV BGR8 Mat from appsink.
-   */
-  void publish_frame(const cv::Mat & frame);
+  bool publish_sample(void * sample);
 
   rclcpp::Logger logger_;
   UdpStreamConfig cfg_;
   bool configured_{false};
+  bool size_logged_{false};
+  bool first_frame_logged_{false};
+  std::string active_decoder_;
 
   /** Separate node so image_transport publishers do not clash with lifecycle rosout. */
   rclcpp::Node::SharedPtr transport_node_;
   std::shared_ptr<image_transport::ImageTransport> it_;
   image_transport::CameraPublisher cam_pub_;
 
-  cv::VideoCapture cap_;
-  std::mutex cap_mutex_;          ///< Guards @ref cap_ across grab / stop.
-  std::atomic<bool> stop_{true};  ///< Set true to end @ref grab_loop.
+  std::unique_ptr<Pipeline> pipeline_;
+  std::mutex pipeline_mutex_;
+  std::atomic<bool> stop_{true};
   std::thread grab_thread_;
 };
 

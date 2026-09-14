@@ -4,8 +4,9 @@
   <name>udp_camera_ros</name>
   <version>0.1.0</version>
   <description>
-    Ground-station UDP H.264/RTP lifecycle receiver (C++). Publishes via
-    image_transport::CameraPublisher (raw + compressed_image_transport).
+    Ground-station UDP H.264/RTP lifecycle receiver (C++). Native GStreamer
+    appsink decode; publishes via image_transport::CameraPublisher
+    (raw + compressed_image_transport).
   </description>
   <maintainer email="mateuszwojcikv@gmail.com">drone</maintainer>
   <license>Apache-2.0</license>
@@ -15,13 +16,20 @@
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
   <depend>sensor_msgs</depend>
-  <depend>cv_bridge</depend>
   <depend>image_transport</depend>
   <depend>compressed_image_transport</depend>
   <depend>ament_index_cpp</depend>
   <depend>yaml_cpp_vendor</depend>
-  <depend>libopencv-dev</depend>
 
+  <build_depend>pkg-config</build_depend>
+  <build_depend>libgstreamer1.0-dev</build_depend>
+  <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
+
+  <exec_depend>gstreamer1.0-tools</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-base</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-good</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-bad</exec_depend>
+  <exec_depend>gstreamer1.0-libav</exec_depend>
   <exec_depend>ros2launch</exec_depend>
   <exec_depend>lifecycle_msgs</exec_depend>
 

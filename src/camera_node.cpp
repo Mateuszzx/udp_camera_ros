@@ -39,7 +39,6 @@ public:
   {
     declare_parameter("port", 5000);
     declare_parameter("image_topic", "/camera/image_raw");
-    declare_parameter("camera_info_topic", "/camera/camera_info");
     declare_parameter("frame_id", "camera_optical_frame");
     declare_parameter("calib_file", "example_calib.yaml");
     declare_parameter("stream_undistorted", false);
@@ -50,6 +49,7 @@ public:
     declare_parameter("stall_timeout_ms", 1500);
     declare_parameter("reconnect_delay_ms", 400);
     declare_parameter("read_timeout_ms", 250);
+    declare_parameter("h264_decoder", "auto");
 
     RCLCPP_INFO(get_logger(), "Lifecycle: unconfigured");
   }
