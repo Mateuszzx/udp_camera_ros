@@ -273,12 +273,11 @@ void UdpStream::configure(const UdpStreamConfig & cfg)
     param_base.erase(param_base.begin());
   }
   std::replace(param_base.begin(), param_base.end(), '/', '.');
-  transport_node_->declare_parameter(
-    param_base + ".enable_pub_plugins",
-    std::vector<std::string>{
-      "image_transport/raw",
-      "image_transport/compressed",
-    });
+  std::vector<std::string> plugins{"image_transport/compressed"};
+  if (cfg_.publish_raw) {
+    plugins.insert(plugins.begin(), "image_transport/raw");
+  }
+  transport_node_->declare_parameter(param_base + ".enable_pub_plugins", plugins);
 
   it_ = std::make_shared<image_transport::ImageTransport>(transport_node_);
   rmw_qos_profile_t qos = cfg_.qos_reliability == "best_effort"
@@ -291,8 +290,10 @@ void UdpStream::configure(const UdpStreamConfig & cfg)
   configured_ = true;
   RCLCPP_INFO(
     logger_,
-    "Configured UDP listen 0.0.0.0:%d -> %s + /compressed ; info->%s",
-    cfg_.port, cfg_.image_topic.c_str(), cam_pub_.getInfoTopic().c_str());
+    "Configured UDP listen 0.0.0.0:%d -> %s%s ; info->%s",
+    cfg_.port, cfg_.image_topic.c_str(),
+    cfg_.publish_raw ? " + /compressed" : "/compressed only",
+    cam_pub_.getInfoTopic().c_str());
   RCLCPP_INFO(
     logger_,
     "Calib source=%s meta_port=%d have_file_info=%s",

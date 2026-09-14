@@ -40,6 +40,15 @@ Used for `file` / `auto` fallback. Accepts:
 - an absolute filesystem path
 - a `package://pkg_name/relative/path.yaml` URL
 
+### `publish_raw`
+
+| Value | Behavior |
+|-------|----------|
+| `false` (default) | Advertise `/compressed` (+ CameraInfo) only |
+| `true` | Also advertise raw `sensor_msgs/Image` |
+
+Consumers should use `image_transport:=compressed` (ArUco / YOLO / detection).
+
 ### `h264_decoder`
 
 | Value | Behavior |

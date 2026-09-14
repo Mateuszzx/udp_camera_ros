@@ -52,6 +52,7 @@ public:
     declare_parameter("reconnect_delay_ms", 400);
     declare_parameter("read_timeout_ms", 250);
     declare_parameter("h264_decoder", "auto");
+    declare_parameter("publish_raw", false);
 
     RCLCPP_INFO(get_logger(), "Lifecycle: unconfigured");
   }

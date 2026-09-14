@@ -42,6 +42,8 @@ struct UdpStreamConfig
   int read_timeout_ms{250};      ///< appsink pull timeout.
   /// auto | avdec_h264 | vah264dec | nvh264dec
   std::string h264_decoder{"auto"};
+  /// When false (default), only advertise /compressed (no raw Image topic).
+  bool publish_raw{false};
 
   /**
    * @brief Sanity-check port, queue_size, qos_reliability, and decoder.

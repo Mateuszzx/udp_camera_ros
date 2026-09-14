@@ -17,3 +17,5 @@ camera_node:
     read_timeout_ms: 250
     # auto tries vah264dec → nvh264dec → avdec_h264
     h264_decoder: "auto"
+    # false = advertise /compressed only (recommended)
+    publish_raw: false
