@@ -41,7 +41,7 @@ ros2 launch udp_camera_ros camera_stream.launch.py \
 | `file` | Intrinsics only from `calib_file` |
 
 Pi sender (`uv run python run_stream.py` in
-`scripts/drone/rpi_gstreamer_camera`) emits UCAL1 JSON on `META_PORT`
+`scripts/drone/rpi_camera_gstreamer`) emits UCAL1 JSON on `META_PORT`
 (default `GS_PORT+1`) via `rpi-gstreamer-camera meta-send`, already scaled to
 stream resolution and matching `UNDISTORT`. Settings live in `config/.env`. Stream meta already carries correct K/D for the live image
 (`camera_info_from_calib`); file calib still uses `stream_undistorted` when
@@ -78,7 +78,7 @@ Used for `file` / `auto` fallback. Accepts:
 ```bash
 # Pi
 WIDTH=1536 HEIGHT=864 BITRATE=16000 uv run python run_stream.py
-# (from scripts/drone/rpi_gstreamer_camera; or set values in config/.env)
+# (from scripts/drone/rpi_camera_gstreamer; or set values in config/.env)
 
 # GS — calib rides on the meta port automatically
 ros2 launch drone_bringup gs_bringup.launch.py
